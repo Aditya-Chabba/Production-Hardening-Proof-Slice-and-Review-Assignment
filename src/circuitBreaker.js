@@ -1,24 +1,5 @@
 'use strict';
 
-// Your task: implement a circuit breaker around PromptPilot's model provider.
-//
-// The supplied tests in test/circuitBreaker.test.js describe the exact behaviour.
-// Do not modify the tests. Make them all pass.
-//
-// Requirements proven by the tests:
-//   - Start in the CLOSED state. While CLOSED, count calls and failures.
-//   - OPEN when (failures / calls) >= failureThreshold AND calls >= minimumRequests.
-//   - While OPEN and within openMillis, SHORT-CIRCUIT: throw CircuitOpenError
-//     WITHOUT calling fn, and increment metrics.short_circuited_total.
-//   - After openMillis has elapsed (use the injected now()), allow ONE probe
-//     call (HALF_OPEN). A successful probe -> CLOSED and reset the counts.
-//     A failed probe -> OPEN again.
-//   - Increment metrics.breaker_open_total every time you move to OPEN.
-//   - Call options.onStateChange(state) on every state transition.
-//
-// Injected options (all optional, with sensible defaults):
-//   failureThreshold, minimumRequests, openMillis, now, onStateChange
-
 class CircuitOpenError extends Error {
   constructor() {
     super('circuit is open');
@@ -27,6 +8,9 @@ class CircuitOpenError extends Error {
 }
 
 function createCircuitBreaker(options = {}) {
+  const failureThreshold = options.failureThreshold ?? 0.5;
+  const minimumRequests = options.minimumRequests ?? 10;
+  const openMillis = options.openMillis ?? 30000;
   const now = options.now ?? Date.now;
   const onStateChange = options.onStateChange ?? function () {};
 
@@ -38,12 +22,68 @@ function createCircuitBreaker(options = {}) {
   };
 
   let state = 'CLOSED';
+  let calls = 0;
+  let failures = 0;
+  let openedAt = 0;
+  let probeInFlight = false;
+
+  function setState(next) {
+    state = next;
+    onStateChange(next);
+  }
+
+  function trip() {
+    openedAt = now();
+    metrics.breaker_open_total++;
+    setState('OPEN');
+  }
+
+  function shortCircuit() {
+    metrics.short_circuited_total++;
+    throw new CircuitOpenError();
+  }
 
   async function exec(fn) {
-    // TODO: Replace this pass-through with real circuit-breaker logic so that
-    // the supplied tests pass. Right now every call goes straight through and
-    // the breaker never opens.
-    return fn();
+    if (state === 'OPEN') {
+      if (now() - openedAt < openMillis) shortCircuit();
+      probeInFlight = false;
+      setState('HALF_OPEN');
+    }
+
+    if (state === 'HALF_OPEN') {
+      if (probeInFlight) shortCircuit();
+      probeInFlight = true;
+      try {
+        const result = await fn();
+        probeInFlight = false;
+        metrics.success_total++;
+        calls = 0;
+        failures = 0;
+        setState('CLOSED');
+        return result;
+      } catch (err) {
+        probeInFlight = false;
+        metrics.failure_total++;
+        trip();
+        throw err;
+      }
+    }
+
+    // CLOSED
+    try {
+      const result = await fn();
+      calls++;
+      metrics.success_total++;
+      return result;
+    } catch (err) {
+      calls++;
+      failures++;
+      metrics.failure_total++;
+      if (calls >= minimumRequests && failures / calls >= failureThreshold) {
+        trip();
+      }
+      throw err;
+    }
   }
 
   return {
